@@ -1,0 +1,80 @@
+---
+title: "Compute_distance"
+author: "Senling Shu"
+date: "9/10/2021"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(data.table)
+library(RColorBrewer)
+#remotes::install_github('SafeGraphInc/SafeGraphR')
+library(SafeGraphR)
+source("safegraph_normalization_function_KES.R")
+```
+
+########################
+Compute Park Centroids 
+########################
+
+```{r}
+IL_parks_gardens <- read.csv(file = 'IL_parks_gardens.csv')
+IL_parks_gardens <- IL_parks_gardens %>% filter(city == "Chicago") #only parks in Chicago 
+Chicago_2019_2020 <- read.csv(file = 'merged_2019_2020_Chicago.csv')
+```
+
+```{r}
+library(sf) #encodes spatial vector data 
+library(rgeos) 
+```
+
+```{r}
+#convert (longitude,latitude) to geometry 
+IL_parks_gardens_sf <- st_as_sf(IL_parks_gardens, coords = c("longitude","latitude") , crs = 4326)
+IL_parks_gardens_sf <- IL_parks_gardens_sf %>% select(location_name,geometry)
+plot(st_geometry(IL_parks_gardens_sf))
+```
+########################
+Compute Tract Centroids 
+########################
+
+```{r}
+tract <- st_read('chicago_tract/chicago_tract.shp') %>% 
+  st_transform(4326)
+
+tract_sf <- st_centroid(tract) #generates the geographic centroids of the given region
+chicago_tract_list <- unique(Chicago_2019_2020$origin_census_tract)
+tract_sf  <- filter(tract_sf, tract_sf$geoid10 %in% chicago_tract_list) #get data for the 798 tracts 
+tract_sf  <- tract_sf %>% select(geoid10, geometry)
+```
+
+
+########################################
+Compute Distance Between Tract And Park  
+798 tracts X 885 parks 
+#######################################
+
+```{r}
+df = data.frame()
+for (i in tract_sf$geoid10) {
+      df1 <- data.frame(tract = rep(i, nrow(IL_parks_gardens_sf)),
+                        location_name = IL_parks_gardens_sf$location_name)
+      df <- rbind(df, df1)
+}
+
+distance = data.frame()
+for (i in 1:length(tract_sf$geoid10)) {
+    print(i)
+    distance1 <- data.frame(distance = st_distance(tract_sf$geometry[i], IL_parks_gardens_sf$geometry, by_element = TRUE))
+    distance <- rbind(distance, distance1)
+}
+
+distance_df <- data.frame(df, distance)
+distance_df$distance <- distance_df$distance * 0.000621 #convert from meters to miles 
+```
+
+```{r}
+write_csv(distance_df, "tract_park_distance.csv")
+```
+
