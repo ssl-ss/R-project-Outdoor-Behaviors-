@@ -1,0 +1,240 @@
+---
+title: "Compute_distance"
+author: "Senling Shu"
+date: "9/10/2021"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(data.table)
+library(RColorBrewer)
+#remotes::install_github('SafeGraphInc/SafeGraphR')
+library(SafeGraphR)
+source("safegraph_normalization_function_KES.R")
+```
+
+########################
+Compute Park Centroids 
+########################
+
+```{r}
+IL_parks_gardens <- read.csv(file = 'IL_parks_gardens.csv')
+IL_parks_gardens <- IL_parks_gardens %>% filter(city == "Chicago") #only parks in Chicago 
+Chicago_2019_2020 <- read.csv(file = 'merged_2019_2020_Chicago.csv')
+```
+
+```{r}
+library(sf) #encodes spatial vector data 
+library(rgeos) 
+```
+
+```{r}
+#convert (longitude,latitude) to geometry 
+IL_parks_gardens_sf <- st_as_sf(IL_parks_gardens, coords = c("longitude","latitude") , crs = 4326)
+IL_parks_gardens_sf <- IL_parks_gardens_sf %>% select(location_name,geometry)
+plot(st_geometry(IL_parks_gardens_sf))
+```
+########################
+Compute Tract Centroids 
+########################
+
+```{r}
+tract <- st_read('chicago_tract/chicago_tract.shp') %>% 
+  st_transform(4326)
+
+tract_sf <- st_centroid(tract) #generates the geographic centroids of the given region
+chicago_tract_list <- unique(Chicago_2019_2020$origin_census_tract)
+tract_sf  <- filter(tract_sf, tract_sf$geoid10 %in% chicago_tract_list) #get data for the 798 tracts 
+tract_sf  <- tract_sf %>% select(geoid10, geometry)
+```
+
+
+########################################
+Compute Distance Between Tract And Park  
+798 tracts X 885 parks 
+#######################################
+
+```{r}
+df = data.frame()
+for (i in tract_sf$geoid10) {
+      df1 <- data.frame(tract = rep(i, nrow(IL_parks_gardens_sf)),
+                        location_name = IL_parks_gardens_sf$location_name)
+      df <- rbind(df, df1)
+}
+
+distance = data.frame()
+for (i in 1:length(tract_sf$geoid10)) {
+    
+    distance1 <- data.frame(distance = st_distance(tract_sf$geometry[i], IL_parks_gardens_sf$geometry, by_element = TRUE))
+    distance <- rbind(distance, distance1)
+}
+
+distance_df <- data.frame(df, distance)
+distance_df$distance <- distance_df$distance * 0.000621 #convert from meters to miles 
+```
+
+```{r}
+write_csv(distance_df, "tract_park_distance.csv")
+```
+
+#######################
+Compute Average Distance
+Traveled by Each Tract
+#######################
+
+```{r}
+#Year of 2019
+weeks_2019 <- list.dirs("weekly pattern/2019") #all the folders
+weeks_2019 <- weeks_2019[which(nchar(weeks_2019)==25)] #only folders for each week, not month subfolders 
+cbg_path <- "distance/2019"
+
+```
+
+Get the files for how often parks were visited by each tract on a weekly basis 
+```{r}
+for (i in 1:length(weeks_2019)) {
+  startdate <- gsub("/", "-",substr(weeks_2019[i],20,23))
+  numparts <- length(list.files(weeks_2019[i], pattern = "\\.gz$"))
+  
+  this_week_pattern <- read_many_patterns(dir = weeks_2019[i], 
+                                  gen_fips = TRUE,
+                                  filter = 'state_fips == 17',
+                                  naics_link = IL_parks_gardens,
+                                  post_by = FALSE,
+                                  start_date = rep(startdate, numparts),
+                                  select = c('safegraph_place_id','visitor_home_cbgs','location_name', 'poi_cbg'))
+  
+  this_week_parks <- this_week_pattern %>% filter(!is.na(naics_code))
+  this_week_parks <- this_week_parks %>% mutate(visitor_home_cbgs = gsub("\"\"","\"",visitor_home_cbgs))
+  
+  text <- this_week_parks %>% select(visitor_home_cbgs, poi_cbg, location_name.x, latitude, longitude)
+  text <- text %>% filter(visitor_home_cbgs != "{}")
+  
+  
+  df1 = data.frame()
+  for (j in 1:length(text$visitor_home_cbgs)) {
+    df2 <- fromJSON(text$visitor_home_cbgs[j]) %>% as.data.frame #get tract:counts from visitor_home_cbgs
+    df2 <- t(df2)
+    df3 <- data.frame(r2= row.names(df2), df2, row.names=NULL) 
+    df3$r2 <- substr(df3$r2, 2, 12)
+    colnames(df3)[1] <- 'r1' #tracts
+    colnames(df3)[2] <- 'df' #counts 
+    df3 <-  df3 %>% mutate(location_name = text$location_name.x[j], latitude = text$latitude[j], longitude = text$longitude[j])
+    df1 <- bind_rows(df1,df3)
+  } 
+  
+  write_csv(df1, path = paste0(cbg_path,substr(weeks_2019[i],18,19),"_",substr(weeks_2019[i],21,22),"_",substr(weeks_2019[i],24,25),".csv"))
+
+}
+
+files <- list.files("distance/2019", recursive = TRUE)
+weekly_df = data.frame()
+for (i in files) {
+  file <- read.csv(paste0("distance/2019/",i))
+  file <- filter(file, file$r1 %in% chicago_tract_list)#only tracts in Chicago 
+  weekly_df <- rbind(weekly_df, file)
+}
+
+weekly_df <- aggregate(weekly_df$df, by=list(location_name=weekly_df$location_name, tract = weekly_df$r1, latitude =weekly_df$latitude, longitude = weekly_df$longitude), FUN=sum)
+```
+
+Convert (longitude,latitude) to geometry and compute the average distance traveled for each tract 
+```{r}
+weekly_df <- st_as_sf(weekly_df, coords = c("longitude", "latitude") , crs = 4326) 
+
+weekly_dis = data.frame()
+for (i in 1:length(weekly_df$location_name)){
+    tmp <- data.frame(tract = weekly_df$tract[i], location = weekly_df$location_name[i], 
+               distance = st_distance(weekly_df$geometry[i],
+               tract_sf[tract_sf$geoid10 == weekly_df$tract[i],]$geometry,by_element = TRUE)* 0.000621)
+    weekly_dis<- rbind(weekly_dis, tmp)
+}
+
+weekly_dis <- weekly_dis %>% mutate(counts = weekly_df$x)
+
+weekly_dis$total <- weekly_dis$distance * weekly_dis$counts
+total_dis_by_tract <- aggregate(weekly_dis$total, by=list(tract=weekly_dis$tract), FUN=sum)
+total_count_by_tract <- aggregate(weekly_dis$counts, by=list(tract=weekly_dis$tract), FUN=sum)
+avg_dis_2019 <- data.frame(tract =total_dis_by_tract$tract, avg = total_dis_by_tract$x / total_count_by_tract$x)
+```
+
+```{r}
+write_csv(avg_dis_2019, "Avg_distance_traveled_19.csv")
+```
+
+```{r}
+#Year of 2020
+weeks_2020 <- list.dirs("weekly pattern/2020") #all the folders
+weeks_2020 <- weeks_2020[which(nchar(weeks_2020)==25)] #only folders for each week, not month subfolders 
+cbg_path <- "distance/2020"
+```
+
+```{r}
+for (i in 1:length(weeks_2020)) {
+  startdate <- gsub("/", "-",substr(weeks_2020[i],20,23))
+  numparts <- length(list.files(weeks_2020[i], pattern = "\\.gz$"))
+  
+  this_week_pattern <- read_many_patterns(dir = weeks_2020[i], 
+                                  gen_fips = TRUE,
+                                  filter = 'state_fips == 17',
+                                  naics_link = IL_parks_gardens,
+                                  post_by = FALSE,
+                                  start_date = rep(startdate, numparts),
+                                  select = c('safegraph_place_id','visitor_home_cbgs','location_name', 'poi_cbg'))
+  
+  this_week_parks <- this_week_pattern %>% filter(!is.na(naics_code))
+  this_week_parks <- this_week_parks %>% mutate(visitor_home_cbgs = gsub("\"\"","\"",visitor_home_cbgs))
+  
+  text <- this_week_parks %>% select(visitor_home_cbgs, poi_cbg, location_name.x, latitude, longitude)
+  text <- text %>% filter(visitor_home_cbgs != "{}")
+  
+  
+  df1 = data.frame()
+  for (j in 1:length(text$visitor_home_cbgs)) {
+    df2 <- fromJSON(text$visitor_home_cbgs[j]) %>% as.data.frame #get tract:counts from visitor_home_cbgs
+    df2 <- t(df2)
+    df3 <- data.frame(r2= row.names(df2), df2, row.names=NULL) 
+    df3$r2 <- substr(df3$r2, 2, 12)
+    colnames(df3)[1] <- 'r1' #tracts
+    colnames(df3)[2] <- 'df' #counts 
+    df3 <-  df3 %>% mutate(location_name = text$location_name.x[j], latitude = text$latitude[j], longitude = text$longitude[j])
+    df1 <- bind_rows(df1,df3)
+  } 
+  
+  write_csv(df1, path = paste0(cbg_path,substr(weeks_2020[i],18,19),"_",substr(weeks_2020[i],21,22),"_",substr(weeks_2020[i],24,25),".csv"))
+
+}
+
+files <- list.files("distance/2020", recursive = TRUE)
+weekly_df = data.frame()
+for (i in files) {
+  file <- read.csv(paste0("distance/2020/",i))
+  file <- filter(file, file$r1 %in% chicago_tract_list)#only tracts in Chicago 
+  weekly_df <- rbind(weekly_df, file)
+}
+
+weekly_df <- aggregate(weekly_df$df, by=list(location_name=weekly_df$location_name, tract = weekly_df$r1, latitude =weekly_df$latitude, longitude = weekly_df$longitude), FUN=sum)
+
+weekly_df <- st_as_sf(weekly_df, coords = c("longitude", "latitude") , crs = 4326) 
+
+weekly_dis = data.frame()
+for (i in 1:length(weekly_df$location_name)){
+    tmp <- data.frame(tract = weekly_df$tract[i], location = weekly_df$location_name[i], 
+               distance = st_distance(weekly_df$geometry[i],
+               tract_sf[tract_sf$geoid10 == weekly_df$tract[i],]$geometry,by_element = TRUE)* 0.000621)
+    weekly_dis<- rbind(weekly_dis, tmp)
+}
+
+weekly_dis <- weekly_dis %>% mutate(counts = weekly_df$x)
+
+weekly_dis$total <- weekly_dis$distance * weekly_dis$counts
+total_dis_by_tract <- aggregate(weekly_dis$total, by=list(tract=weekly_dis$tract), FUN=sum)
+total_count_by_tract <- aggregate(weekly_dis$counts, by=list(tract=weekly_dis$tract), FUN=sum)
+avg_dis_2020 <- data.frame(tract =total_dis_by_tract$tract, avg = total_dis_by_tract$x / total_count_by_tract$x)
+```
+
+```{r}
+write_csv(avg_dis_2020, "Avg_distance_traveled_20.csv")
+```
+
